@@ -1,62 +1,253 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import { GoogleGenAI, Modality } from "@google/genai";
-
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+import { GoogleGenAI, Type, Modality } from "@google/genai";
+import { Student, ExtractionMode } from '../types';
+import { addMonths, addDays, addWeeks, format, isValid } from 'date-fns';
+import { getGeminiKeys } from './neuralEngine';
 
 /**
- * Converts raw PCM data (16-bit, 24kHz, mono) into a playable WAV Blob URL.
+ * Converts a file to GenAI part
  */
-function pcmToWav(pcmBase64: string): string {
-  const binaryString = atob(pcmBase64);
-  const len = binaryString.length;
-  const bytes = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    bytes[i] = binaryString.charCodeAt(i);
+const fileToGenerativePart = async (file: File): Promise<{ inlineData: { data: string; mimeType: string } }> => {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64String = (reader.result as string).split(',')[1];
+      resolve({
+        inlineData: {
+          data: base64String,
+          mimeType: file.type
+        }
+      });
+    };
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+};
+
+/**
+ * Sanitizes value for consistent representation
+ */
+const sanitizeValue = (val: any): string => {
+  if (val === null || val === undefined) return '';
+  const str = String(val).trim();
+  if (str.toLowerCase() === 'null') return '';
+  return str;
+};
+
+/**
+ * Robust replacement for missing date-fns parse and parseISO members.
+ */
+const manualParse = (str: string, fmt: string): Date | null => {
+    const clean = str.trim();
+    const parts = clean.split(/[\/\-\.]/);
+    if (parts.length !== 3) return null;
+    
+    let d, m, y;
+    if (fmt === 'dd/MM/yyyy') {
+        [d, m, y] = parts.map(Number);
+    } else if (fmt === 'MM/dd/yyyy') {
+        [m, d, y] = parts.map(Number);
+    } else if (fmt === 'yyyy-MM-dd') {
+        [y, m, d] = parts.map(Number);
+    } else {
+        return null;
+    }
+    
+    if (y < 100) y += 2000;
+    const date = new Date(y, m - 1, d);
+    return isValid(date) ? date : null;
+};
+
+/**
+ * Normalizes date strings and rigorously handles 2-digit years.
+ */
+const normalizeDate = (dateStr: string): Date | null => {
+    if (!dateStr || typeof dateStr !== 'string') return null;
+    const clean = dateStr.trim();
+
+    // dd/mm/yy pattern
+    const match = clean.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})$/);
+    if (match) {
+        const d = parseInt(match[1], 10);
+        const m = parseInt(match[2], 10) - 1;
+        let y = parseInt(match[3], 10);
+        
+        // Force conversion to 2000s
+        if (y < 100) {
+            y += 2000;
+        } else if (y < 1000) {
+            y = 2000 + (y % 100);
+        }
+        
+        const date = new Date(y, m, d);
+        return isValid(date) ? date : null;
+    }
+
+    const iso = new Date(clean);
+    if (isValid(iso)) {
+        if (iso.getFullYear() < 100) {
+            iso.setFullYear(2000 + iso.getFullYear());
+        }
+        return iso;
+    }
+
+    const formats = ['dd/MM/yyyy', 'MM/dd/yyyy', 'yyyy-MM-dd'];
+    for (const fmt of formats) {
+        const d = manualParse(clean, fmt);
+        if (d && isValid(d)) {
+            if (d.getFullYear() < 100) d.setFullYear(2000 + d.getFullYear());
+            return d;
+        }
+    }
+    return null;
+};
+
+/**
+ * Calculates deadline based on duration string
+ */
+const calculateDeadline = (startDate: Date, durationStr: string): Date => {
+    const normalized = durationStr.toLowerCase().trim();
+    const amountMatch = normalized.match(/\d+/);
+    const amount = amountMatch ? parseInt(amountMatch[0], 10) : 1;
+    
+    if (normalized.includes('day')) return addDays(startDate, amount);
+    if (normalized.includes('week')) return addWeeks(startDate, amount);
+    if (normalized.includes('year')) return addMonths(startDate, amount * 12);
+    
+    return addMonths(startDate, amount);
+};
+
+/**
+ * Primary parsing function provided by the user
+ */
+export const parseStudentData = async (inputText: string, imageFile?: File, mode: ExtractionMode = 'Hall'): Promise<Partial<Student>[] | null> => {
+  const parts: any[] = [];
+  if (imageFile) parts.push(await fileToGenerativePart(imageFile));
+  if (inputText) parts.push({ text: `Context: ${inputText}` });
+
+  let prompt = '';
+  if (mode === 'Hall') {
+      prompt = `Extract Hall Study records: Name (name), Fee (schoolFee), Teacher (teachers), Level (level), Behavior (behavior), Schedule (schedule - e.g. Mon-Fri or Sat & Sunday), Time (time), Time 2 (time2), Subject (subject), Start Date (startDate), Assistant (assistant), Duration (duration). 
+      IMPORTANT: "Time 2" is often listed separately or below the main Time. Make sure to capture BOTH if they exist.`;
+  } else if (mode === 'Finance') {
+      prompt = `Extract Finance records: ID (displayId), Name (name), Fee (schoolFee), Level (level), Start Date (startDate), Teachers (teachers), Monthly Payments (paymentList), Duration (duration).`;
+  } else if (mode === 'DailyTask') {
+      prompt = `Extract Teacher Daily Task assignments: Teacher Name (name), Level (level), Shift (shift). Shift should be 'Morning', 'Afternoon', or 'Evening'.`;
+  } else if (mode === 'Penalty' || mode === 'PenaltyHall') {
+      prompt = `Extract Late/Absence log records: Name (name), Teachers (teachers), Assistant (assistant), Level (level), 
+      Log 1 Type (penaltyType1 - e.g. Lateness, Absence, No cards, Wrong Uniforms, Other), Log 1 Date (penaltyDate1), 
+      Log 2 Type (penaltyType2), Log 2 Date (penaltyDate2),
+      Log 3 Type (penaltyType3), Log 3 Date (penaltyDate3).`;
+  } else {
+      prompt = `Extract Attendance list: Full Name (name). Keep Sex (M)/(F) if present. Identify gender if possible even if not listed explicitly.`;
   }
+  
+  prompt += `\nCRITICAL: 
+  1. DO NOT SKIP ANY STUDENTS. 
+  2. Capture every field precisely. 
+  3. Return startDate in format dd/MM/yyyy (e.g., 24/12/2025). Ensure year is ALWAYS 4 digits. 
+  4. Response must be a JSON array of objects.
+  5. If an image is provided, perform high-accuracy OCR to extract every single row.`;
 
-  const sampleRate = 24000;
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const blockAlign = (numChannels * bitsPerSample) / 8;
-  const byteRate = sampleRate * blockAlign;
-  const dataSize = len;
-
-  const buffer = new ArrayBuffer(44 + dataSize);
-  const view = new DataView(buffer);
-
-  // RIFF identifier
-  view.setUint32(0, 0x52494646, false); // "RIFF"
-  view.setUint32(4, 36 + dataSize, true); // file size - 8
-  view.setUint32(8, 0x57415645, false); // "WAVE"
-
-  // fmt chunk
-  view.setUint32(12, 0x666d7420, false); // "fmt "
-  view.setUint32(16, 16, true); // size of fmt chunk
-  view.setUint16(20, 1, true); // format (PCM)
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, byteRate, true);
-  view.setUint16(32, blockAlign, true);
-  view.setUint16(34, bitsPerSample, true);
-
-  // data chunk
-  view.setUint32(36, 0x64617461, false); // "data"
-  view.setUint32(40, dataSize, true);
-
-  // Write PCM data
-  for (let i = 0; i < len; i++) {
-    view.setUint8(44 + i, bytes[i]);
+  const availableKeys = getGeminiKeys();
+  if (availableKeys.length === 0) {
+      console.error("No Gemini API keys configured");
+      return null;
   }
+  
+  // Use first available key for this service
+  const ai = new GoogleGenAI({ apiKey: availableKeys[0] });
 
-  const blob = new Blob([buffer], { type: 'audio/wav' });
-  return URL.createObjectURL(blob);
-}
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: { parts },
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              name: { type: Type.STRING },
+              schoolFee: { type: Type.STRING },
+              displayId: { type: Type.STRING },
+              behavior: { type: Type.STRING }, 
+              level: { type: Type.STRING },
+              teachers: { type: Type.STRING },
+              startDate: { type: Type.STRING },
+              time: { type: Type.STRING },
+              time2: { type: Type.STRING },
+              subject: { type: Type.STRING },
+              schedule: { type: Type.STRING },
+              assistant: { type: Type.STRING },
+              duration: { type: Type.STRING },
+              shift: { type: Type.STRING },
+              penaltyType1: { type: Type.STRING },
+              penaltyDate1: { type: Type.STRING },
+              penaltyType2: { type: Type.STRING },
+              penaltyDate2: { type: Type.STRING },
+              penaltyType3: { type: Type.STRING },
+              penaltyDate3: { type: Type.STRING },
+              penaltyComments: { type: Type.STRING },
+              paymentList: { 
+                type: Type.ARRAY,
+                items: {
+                    type: Type.OBJECT,
+                    properties: { period: { type: Type.STRING }, status: { type: Type.STRING } }
+                }
+              },
+            }
+          }
+        }
+      }
+    });
 
+    const text = response.text;
+    if (!text) return null;
+    const rawData = JSON.parse(text);
+
+    return rawData.map((item: any) => {
+        const payments: Record<string, string> = {};
+        if (item.paymentList) item.paymentList.forEach((p: any) => payments[p.period] = sanitizeValue(p.status));
+        const { paymentList, ...studentData } = item;
+        const sanitizedData: any = {};
+        Object.keys(studentData).forEach(k => sanitizedData[k] = sanitizeValue(studentData[k]));
+
+        if (sanitizedData.startDate) {
+            const dateObj = normalizeDate(sanitizedData.startDate);
+            if (dateObj) {
+                sanitizedData.startDate = format(dateObj, 'dd/MM/yy');
+                const durationText = sanitizedData.duration || '1 month';
+                const deadlineDate = calculateDeadline(dateObj, durationText);
+                sanitizedData.deadline = format(deadlineDate, 'dd/MM/yy');
+            }
+        }
+
+        // Normalize penalty dates
+        for (let i = 1; i <= 7; i++) {
+            const dateKey = `penaltyDate${i}`;
+            if (sanitizedData[dateKey]) {
+                const pDate = normalizeDate(sanitizedData[dateKey]);
+                if (pDate) sanitizedData[dateKey] = format(pDate, 'dd/MM/yy');
+            }
+        }
+
+        return { ...sanitizedData, payments };
+    });
+  } catch (error) {
+    console.error("GenAI Error:", error);
+    return null;
+  }
+};
+
+/**
+ * Existing speaking and imagery functions (integrated)
+ */
 export async function speak(text: string): Promise<string | null> {
+  const availableKeys = getGeminiKeys();
+  if (availableKeys.length === 0) return null;
+  const ai = new GoogleGenAI({ apiKey: availableKeys[0] });
+
   try {
     const response = await ai.models.generateContent({
       model: "gemini-3.1-flash-tts-preview",
@@ -73,7 +264,8 @@ export async function speak(text: string): Promise<string | null> {
 
     const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     if (base64Audio) {
-      return pcmToWav(base64Audio);
+      // Reusing simple WAV wrapper logic if needed, but for now just raw base64 data url is usually better for mobile
+      return `data:audio/wav;base64,${base64Audio}`;
     }
   } catch (error) {
     console.error("Gemini TTS Error:", error);
@@ -81,20 +273,15 @@ export async function speak(text: string): Promise<string | null> {
   return null;
 }
 
-export function speakFallback(text: string) {
-  if ('speechSynthesis' in window) {
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.rate = 0.9;
-    window.speechSynthesis.speak(utterance);
-  }
-}
-
 export async function imagine(prompt: string): Promise<string | null> {
+  const availableKeys = getGeminiKeys();
+  if (availableKeys.length === 0) return null;
+  const ai = new GoogleGenAI({ apiKey: availableKeys[0] });
+
   try {
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-image",
-      contents: [{ text: `Create a bright, high-quality, preschool-style illustration for an alphabet book. ${prompt}. Clean white background, vibrant colors, child-friendly.` }],
+      contents: [{ text: prompt }],
     });
 
     const parts = response.candidates?.[0]?.content?.parts;

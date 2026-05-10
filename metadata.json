@@ -1,6 +1,6 @@
 {
-  "name": "Remix: ABC Adventure: Kids Alphabet Learning \u0026 Exercises",
-  "description": "An interactive alphabet learning app for students based on a lesson. Includes image pronunciations and varied exercises for letters A to Z.",
+  "name": "Student Intelligence Suite: AI Extraction & Management",
+  "description": "An AI-powered student data extraction and management tool. Automatically parses teacher daily tasks, finance records, and hall study logs using Gemini 3.0 Flash OCR and multi-key throughput.",
   "requestFramePermissions": [],
   "majorCapabilities": []
 }
