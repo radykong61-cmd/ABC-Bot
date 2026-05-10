@@ -1,0 +1,21 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand-bg: #F7F9FC;
+  --color-brand-card: #FFFFFF;
+  --color-brand-primary: #2D3436;
+  --color-brand-secondary: #636E72;
+  --color-brand-accent: #4A90E2;
+  --color-brand-accent-soft: #E1F0FF;
+  --color-brand-success: #2ECC71;
+  
+  --radius-brand: 20px;
+  
+  --font-sans: 'Helvetica Neue', Arial, sans-serif;
+}
+
+@layer base {
+  body {
+    @apply antialiased bg-brand-bg text-brand-primary;
+  }
+}
